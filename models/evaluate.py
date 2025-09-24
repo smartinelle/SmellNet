@@ -1,356 +1,317 @@
+# evaluate.py
+from __future__ import annotations
 import torch
-from scipy.stats import mode
-import numpy as np
 import torch.nn.functional as F
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    accuracy_score,
-)
+import numpy as np
+from typing import Callable, Dict, Optional, Sequence, Union, Tuple  # already present
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
+# ------------------------ utils ------------------------
+def _device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def transformer_evaluate(model, testing_data, le, logger):
-    WINDOW_SIZE = 100
-    STRIDE = 50
+def _maybe_to_device(x, device, dtype=None):
+    if x is None:
+        return None
+    if isinstance(x, (list, tuple)):
+        return type(x)(_maybe_to_device(t, device, dtype) for t in x)
+    if torch.is_tensor(x):
+        x = x.to(device)
+        if dtype is not None:
+            x = x.to(dtype)  # <-- cast regardless of original dtype
+        return x
+    return x
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.double()
+def _unpack_batch(batch):
+    # Supports (x, y) or (x, y, lengths)
+    if isinstance(batch, (tuple, list)) and len(batch) == 3:
+        return batch[0], batch[1], batch[2]
+    x, y = batch
+    return x, y, None
 
-    def predict_by_sliding_window(df, model, ingredient):
-        segments = []
-        for start in range(0, len(df) - WINDOW_SIZE + 1, STRIDE):
-            window = df.iloc[start : start + WINDOW_SIZE].values
-            segments.append(window)
+def _topk_correct(logits: torch.Tensor, targets: torch.Tensor, k: int) -> int:
+    k = min(k, logits.shape[1])
+    topk = torch.topk(logits, k=k, dim=1).indices  # (B, k)
+    return (topk == targets.unsqueeze(1)).any(dim=1).sum().item()
 
-        X = torch.tensor(segments, dtype=torch.double).to(device)
-
-        with torch.no_grad():
-            logits = model(X)
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-            top5_preds = torch.topk(probs, k=5, dim=1).indices  # [num_windows, 5]
-
-        return (
-            preds.cpu().numpy(),
-            top5_preds.cpu().numpy(),
-            [ingredient] * len(segments),
-        )
-
-    # === Run on test_data ===
-    all_preds = []
-    all_true_labels = []
-    all_top5 = []
-
-    model.eval()
-    for ingredient, dfs in testing_data.items():
-        for df in dfs:
-            df = df.iloc[:512]  # clip to 512 time steps
-            preds, top5_preds, labels = predict_by_sliding_window(df, model, ingredient)
-            all_preds.extend(preds)
-            all_top5.append(top5_preds)
-            all_true_labels.extend(labels)
-
-    # === Evaluation ===
-    true_labels_encoded = le.transform(all_true_labels)
-    all_preds_np = np.array(all_preds)
-    all_top5_np = np.vstack(all_top5)  # stack all top-5 arrays
-
-    accuracy = accuracy_score(true_labels_encoded, all_preds_np) * 100
-
-    # Compute Top-5 accuracy
-    top5_correct = np.any(all_top5_np == true_labels_encoded[:, None], axis=1)
-    top5_accuracy = np.mean(top5_correct) * 100
-
-    decoded_preds = le.inverse_transform(all_preds_np)
-
-    logger.info(f"✅ Window-Level Test Accuracy (Top-1): {accuracy:.2f}%")
-    logger.info(f"✅ Window-Level Top-5 Accuracy: {top5_accuracy:.2f}%")
-
-    # for true, pred in zip(all_true_labels, decoded_preds):
-    #     logger.info(f"True: {true:15s} | Predicted: {pred}")
-
-
-def regular_evaluate(
-    model, data_loader, le, logger=None, lstm=False, translation=False
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model.to(device)
-    model.double()
-    model.eval()
-
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device, dtype=torch.double)
-            labels = labels.to(device)
-
-            if lstm:
-                logits, embedding = model(inputs)
-            elif translation:
-                gcms_pred, logits = model(inputs)
-            else:
-                logits = model(inputs)
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    acc = accuracy_score(all_labels, all_preds) * 100
-
-    if logger:
-        logger.info(f"✅ Regular Evaluation Accuracy: {acc:.2f}%")
-        # decoded_preds = le.inverse_transform(all_preds)
-        # decoded_true = le.inverse_transform(all_labels)
-        # for true, pred in zip(decoded_true, decoded_preds):
-        #     logger.info(f"True: {true:15s} | Predicted: {pred}")
-    else:
-        print(f"✅ Accuracy: {acc:.2f}%")
-
-    return acc
-
-
-def regular_evaluate_top5(
-    model, data_loader, le, logger=None, lstm=False, translation=False
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model.to(device)
-    model.double()
-    model.eval()
-
-    all_top5_correct = []
-    all_labels = []
-
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device, dtype=torch.double)
-            labels = labels.to(device)
-
-            if lstm:
-                logits, embedding = model(inputs)
-            elif translation:
-                _, logits = model(inputs)
-            else:
-                logits = model(inputs)
-            probs = torch.softmax(logits, dim=1)
-
-            # Get top-5 predictions
-            top5_preds = torch.topk(probs, k=5, dim=1).indices  # shape [batch_size, 5]
-
-            # Check if true label is in top-5 predictions
-            for i in range(labels.size(0)):
-                if labels[i].item() in top5_preds[i]:
-                    all_top5_correct.append(1)
-                else:
-                    all_top5_correct.append(0)
-
-            all_labels.extend(labels.cpu().numpy())
-
-    # Calculate top-5 accuracy
-    top5_acc = sum(all_top5_correct) / len(all_top5_correct) * 100
-
-    if logger:
-        logger.info(f"✅ Regular Evaluation Top-5 Accuracy: {top5_acc:.2f}%")
-    else:
-        print(f"✅ Top-5 Accuracy: {top5_acc:.2f}%")
-
-    return top5_acc
-
-
-def fusion_evaluate(model, data_loader, le, logger=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model.to(device)
-    model.double()
-    model.eval()
-
-    all_preds = []
-    all_labels = []
-    all_top5 = []
-
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device, dtype=torch.double)
-            labels = labels.to(device)
-
-            logits = model(
-                inputs,
-                torch.zeros((inputs.shape[0], 17), device=device, dtype=torch.double),
-            )
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-            top5_preds = torch.topk(probs, k=5, dim=1).indices  # [batch_size, 5]
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_top5.append(top5_preds.cpu())
-
-    all_labels_np = np.array(all_labels)
-    all_preds_np = np.array(all_preds)
-    all_top5_np = torch.cat(all_top5, dim=0).numpy()
-
-    acc = accuracy_score(all_labels_np, all_preds_np) * 100
-
-    # Compute Top-5 Accuracy
-    top5_correct = np.any(all_top5_np == all_labels_np[:, None], axis=1)
-    top5_acc = np.mean(top5_correct) * 100
-
-    if logger:
-        logger.info(f"✅ Regular Evaluation Accuracy (Top-1): {acc:.2f}%")
-        logger.info(f"✅ Top-5 Accuracy: {top5_acc:.2f}%")
-        decoded_preds = le.inverse_transform(all_preds_np)
-        decoded_true = le.inverse_transform(all_labels_np)
-        # for true, pred in zip(decoded_true, decoded_preds):
-        #     logger.info(f"True: {true:15s} | Predicted: {pred}")
-    else:
-        print(f"✅ Accuracy (Top-1): {acc:.2f}%")
-        print(f"✅ Top-5 Accuracy: {top5_acc:.2f}%")
-
-    return acc, top5_acc
-
-
-def contrastive_evaluate(
-    test_smell_data,
-    gcms_data,
-    test_smell_label,
-    gcms_encoder,
-    sensor_encoder,
-    logger,
-    lstm=False,
-):
+def _build_class_to_category(
+    class_names: Sequence[str],
+    ingredient_to_category: Dict[str, str],
+) -> Tuple[Dict[int, str], set]:
     """
-    Evaluate how well the model matches GCMS embeddings to sensor embeddings.
     Returns:
-      - Top-1 accuracy
-      - Top-5 accuracy
-      - Top-5 predicted indices per sample
-      - Top-5 cosine similarity scores (pre-softmax)
+      class_to_cat: {class_id -> category_name}
+      missing: set of ingredient names not found in mapping
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    missing = set()
+    class_to_cat: Dict[int, str] = {}
+    for i, name in enumerate(class_names):
+        cat = ingredient_to_category.get(name)
+        if cat is None:
+            missing.add(name)
+            cat = "UNKNOWN"
+        class_to_cat[i] = cat
+    return class_to_cat, missing
 
-    gcms_encoder.to(device)
-    sensor_encoder.to(device)
+# -------------------- classification -------------------
+def evaluate(
+    model: torch.nn.Module,
+    data_loader,
+    *,
+    logger=None,
+    topk: Sequence[int] = (1, 5),
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+    logits_from_output: Optional[Callable[[object], torch.Tensor]] = None,
+    ingredient_to_category: Optional[Dict[str, str]] = None,
+    class_names: Optional[Sequence[str]] = None,   # usually le.classes_
+) -> Dict[str, Union[float, np.ndarray]]:
+    """
+    Generic classifier evaluation.
+    Batches may be (x, y) or (x, y, lengths). Returns acc@k plus macro metrics.
+    If your model returns a tuple (e.g., (logits, embedding)), pass a picker via logits_from_output.
+    """
+    dev = device or _device()
+    model.to(dev).eval()
 
-    gcms_encoder.eval()
-    sensor_encoder.eval()
+    # default: accept logits or (logits, ...)
+    if logits_from_output is None:
+        def logits_from_output(out):
+            if isinstance(out, (tuple, list)):
+                return out[0]
+            return out
 
-    # Move to device
-    gcms_data = torch.tensor(gcms_data, dtype=torch.float).to(device)
-    test_smell_data = torch.tensor(test_smell_data, dtype=torch.float).to(device)
-    test_smell_label = torch.tensor(test_smell_label).to(device)
+    total = 0
+    correct_at = {k: 0 for k in topk}
+    ys, preds = [], []
+    # --- capture per-sample top-k hits if we need per-category acc@5 ---
+    need_topk = any(k > 1 for k in topk)
+    topk_hits_batches: Dict[int, list] = {k: [] for k in topk if k > 1}
 
     with torch.no_grad():
-        z_gcms = F.normalize(gcms_encoder(gcms_data), dim=1)
-        if lstm:
-            z_smell = F.normalize(sensor_encoder(test_smell_data)[0], dim=1)
+        for batch in data_loader:
+            x, y, lengths = _unpack_batch(batch)
+            x = _maybe_to_device(x, dev, dtype)
+            y = _maybe_to_device(y, dev)
+            lengths = _maybe_to_device(lengths, dev)
+
+            out = model(x, lengths=lengths)
+            logits = logits_from_output(out)
+
+            bs = y.size(0)
+            total += bs
+
+            pred = logits.argmax(dim=1)
+            ys.append(y.cpu())
+            preds.append(pred.cpu())
+
+            for k in topk:
+                correct_at[k] += _topk_correct(logits, y, k)
+
+            if need_topk:
+                for k in topk:
+                    if k > 1:
+                        tk = torch.topk(logits, k=min(k, logits.shape[1]), dim=1).indices
+                        hits = (tk == y.unsqueeze(1)).any(dim=1).cpu().numpy()  # (B,)
+                        topk_hits_batches[k].append(hits)
+
+    y_np = torch.cat(ys).numpy() if ys else np.array([])
+    p_np = torch.cat(preds).numpy() if preds else np.array([])
+
+    results: Dict[str, Union[float, np.ndarray, Dict]] = {}
+    for k in topk:
+        results[f"acc@{k}"] = 100.0 * (correct_at[k] / max(total, 1))
+
+    # macro metrics
+    if total > 0:
+        results["precision_macro"] = precision_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["recall_macro"]    = recall_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["f1_macro"]        = f1_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["confusion_matrix"] = confusion_matrix(y_np, p_np)
+
+    # --- per-category accuracy (optional) ---
+    if (ingredient_to_category is not None) and (class_names is not None) and (len(y_np) > 0):
+        class_to_cat, missing = _build_class_to_category(class_names, ingredient_to_category)
+        if logger and missing:
+            logger.warning(f"[evaluate] {len(missing)} classes missing in ingredient_to_category; counted as 'UNKNOWN'.")
+
+        # true category per sample
+        true_cat = np.array([class_to_cat[int(c)] for c in y_np], dtype=object)
+        correct1 = (p_np == y_np)
+
+        per_cat: Dict[str, Dict[str, float]] = {}
+        for cat in np.unique(true_cat):
+            mask = (true_cat == cat)
+            n = int(mask.sum())
+            acc1 = float(correct1[mask].mean()*100.0) if n > 0 else 0.0
+            row = {"n": n, "acc@1": acc1}
+
+            # acc@5 if requested
+            if need_topk and 5 in topk:
+                hits5 = np.concatenate(topk_hits_batches[5], axis=0) if topk_hits_batches[5] else np.array([])
+                acc5 = float(hits5[mask].mean()*100.0) if hits5.size else 0.0
+                row["acc@5"] = acc5
+
+            per_cat[str(cat)] = row
+
+        results["per_category"] = per_cat  # {category: {"n": int, "acc@1": %, "acc@5": %?}}
+
+    if logger:
+        msg = " | ".join([f"acc@{k}: {results[f'acc@{k}']:.2f}%" for k in topk])
+        logger.info(f"✅ Evaluation — {msg}")
+        if "per_category" in results:
+            logger.info("Per-category acc:")
+            for cat, row in results["per_category"].items():
+                extras = f", acc@5={row['acc@5']:.2f}%" if ("acc@5" in row) else ""
+                logger.info(f"  - {cat}: n={row['n']}, acc@1={row['acc@1']:.2f}%{extras}")
+    else:
+        print({k: (round(v, 2) if isinstance(v, float) else v) for k, v in results.items() if "matrix" not in k})
+
+    return results
+
+# --------------------- contrastive ---------------------
+def evaluate_contrastive(
+    gcms_encoder: torch.nn.Module,
+    sensor_encoder: torch.nn.Module,
+    *,
+    gcms_data: Union[torch.Tensor, np.ndarray],      # (N_g, Dg) or tensor acceptable by encoder
+    sensor_data: Union[torch.Tensor, np.ndarray],    # (N_s, T, C) or (N_s, Ds)
+    sensor_labels: Union[torch.Tensor, np.ndarray],  # (N_s,) integer indices into gcms rows
+    lengths: Optional[torch.Tensor] = None,          # optional for padded sensor sequences
+    logger=None,
+    l2_normalize: bool = True,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+    batch_size: Optional[int] = None,                # set to chunk-encode large sensor_data
+    ingredient_to_category: Optional[Dict[str, str]] = None,
+    class_names: Optional[Sequence[str]] = None,     # le.classes_
+    topk: Sequence[int] = (1, 5),                    # <<< align with `evaluate`
+) -> Dict[str, Union[float, np.ndarray]]:
+    """
+    Contrastive evaluation mirroring `evaluate`'s output format.
+    Computes cosine similarity between sensor and GCMS embeddings and returns:
+      - acc@k for each k in `topk`
+      - precision_macro, recall_macro, f1_macro, confusion_matrix
+      - per_category (optional; includes acc@1 and acc@5 if requested)
+      - (extra) topk_idx/topk_sim for convenience (max over requested k)
+    """
+    dev = device or _device()
+    gcms_encoder.to(dev).eval()
+    sensor_encoder.to(dev).eval()
+
+    # to tensors
+    if not torch.is_tensor(gcms_data):      gcms_data = torch.tensor(gcms_data)
+    if not torch.is_tensor(sensor_data):    sensor_data = torch.tensor(sensor_data)
+    if not torch.is_tensor(sensor_labels):  sensor_labels = torch.tensor(sensor_labels, dtype=torch.long)
+
+    gcms_data = _maybe_to_device(gcms_data, dev, dtype)
+    sensor_labels = _maybe_to_device(sensor_labels, dev)
+    lengths = _maybe_to_device(lengths, dev)
+
+    # encode GCMS in one go (usually small)
+    with torch.no_grad():
+        zg = gcms_encoder.forward_features(gcms_data) if hasattr(gcms_encoder, "forward_features") else gcms_encoder(gcms_data)
+        if l2_normalize:
+            zg = F.normalize(zg, dim=1)
+
+    # encode sensor (optionally in chunks)
+    with torch.no_grad():
+        zs_list = []
+        if batch_size is None:
+            sd = _maybe_to_device(sensor_data, dev, dtype)
+            len_batch = lengths
+            z = sensor_encoder.forward_features(sd, lengths=len_batch) if hasattr(sensor_encoder, "forward_features") else sensor_encoder(sd)
+            zs_list.append(z)
         else:
-            z_smell = F.normalize(sensor_encoder(test_smell_data), dim=1)
+            N = sensor_data.size(0)
+            for i in range(0, N, batch_size):
+                sd = _maybe_to_device(sensor_data[i:i+batch_size], dev, dtype)
+                len_batch = None if lengths is None else lengths[i:i+batch_size]
+                z = sensor_encoder.forward_features(sd, lengths=len_batch) if hasattr(sensor_encoder, "forward_features") else sensor_encoder(sd)
+                zs_list.append(z)
 
-        # Cosine similarity matrix: [num_test_samples, num_gcms_samples]
-        sim = torch.matmul(z_smell, z_gcms.T)
+        zs = torch.cat(zs_list, dim=0)
+        if l2_normalize:
+            zs = F.normalize(zs, dim=1)
 
-        # Top-1 accuracy
-        top1_pred = sim.argmax(dim=1)
-        top1_correct = (top1_pred == test_smell_label).float().mean().item() * 100
+        # cosine similarity matrix (N_s, N_g)
+        sim = zs @ zg.T
 
-        # Top-5 predictions
-        top5_sim, top5_pred = torch.topk(sim, k=5, dim=1)  # values and indices
-        top5_correct = (top5_pred == test_smell_label.unsqueeze(1)).any(
-            dim=1
-        ).float().mean().item() * 100
+        # predictions
+        top1 = sim.argmax(dim=1)  # (N_s,)
+        y = sensor_labels
+        total = y.size(0)
 
-    logger.info("------------------Test Statistics---------------------")
-    logger.info(f"Top-1 Accuracy: {top1_correct:.2f}%")
-    logger.info(f"Top-5 Accuracy: {top5_correct:.2f}%")
+        # acc@k (generic)
+        results: Dict[str, Union[float, np.ndarray, Dict]] = {}
+        need_topk = any(k > 1 for k in topk)
+        max_k = min(max(topk), sim.shape[1])
+        # precompute a single topk up to max requested k for convenience exports
+        topk_val_all, topk_idx_all = torch.topk(sim, k=max_k, dim=1)
 
-    return top1_correct, top5_correct, top5_pred.cpu().numpy(), top5_sim.cpu().numpy()
+        # compute acc@k exactly for requested k (not just max_k)
+        for k in topk:
+            kk = min(k, sim.shape[1])
+            idx_k = topk_idx_all[:, :kk]
+            acc_k = (idx_k == y.unsqueeze(1)).any(dim=1).float().mean().item() * 100.0
+            results[f"acc@{k}"] = acc_k
 
+    # macro metrics (align with `evaluate`)
+    y_np = y.cpu().numpy()
+    p_np = top1.cpu().numpy()
+    if total > 0:
+        results["precision_macro"] = precision_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["recall_macro"]    = recall_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["f1_macro"]        = f1_score(y_np, p_np, average="macro", zero_division=0) * 100
+        results["confusion_matrix"] = confusion_matrix(y_np, p_np)
 
-def contrastive_evaluate_transformer(
-    testing_data,
-    testing_label,
-    gcms_data,
-    gcms_encoder,
-    sensor_encoder,
-    logger,
-    window_size=100,
-    stride=50,
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # convenience exports (optional; remove if you want an exact match)
+    results["topk_idx"] = topk_idx_all[:, :max_k].cpu().numpy()
+    results["topk_sim"] = topk_val_all[:, :max_k].cpu().numpy()
 
-    gcms_encoder = gcms_encoder.float().to(device)
-    sensor_encoder = sensor_encoder.float().to(device)
-    gcms_encoder.eval()
-    sensor_encoder.eval()
+    # --- per-category (by TRUE category of sensor_labels) ---
+    if (ingredient_to_category is not None) and (class_names is not None) and (total > 0):
+        class_to_cat, missing = _build_class_to_category(class_names, ingredient_to_category)
+        if logger and missing:
+            logger.warning(f"[contrastive] {len(missing)} classes missing in ingredient_to_category; counted as 'UNKNOWN'.")
 
-    # Prepare GCMS embeddings
-    gcms_data_tensor = torch.tensor(gcms_data, dtype=torch.float).to(device)
-    with torch.no_grad():
-        gcms_embeddings = gcms_encoder(gcms_data_tensor)
-        z_gcms = F.normalize(gcms_embeddings, dim=1)
+        true_cat = np.array([class_to_cat[int(c)] for c in y_np], dtype=object)
+        correct1 = (p_np == y_np)
 
-    all_smell_embeddings = []
-    all_smell_labels = []
+        # prepare hits@5 if requested (to mirror `evaluate`'s shape/keys)
+        per_cat: Dict[str, Dict[str, float]] = {}
+        include_acc5 = (need_topk and 5 in topk)
+        hits5 = None
+        if include_acc5:
+            kk = min(5, sim.shape[1])
+            idx5 = topk_idx_all[:, :kk].cpu().numpy()
+            hits5 = (idx5 == y_np[:, None]).any(axis=1)
 
-    # Process smell data with sliding window
-    for array, label_idx in zip(testing_data, testing_label):
-        df_len = array.shape[0]
-        segments = []
-        for start in range(0, df_len - window_size + 1, stride):
-            window = array[start : start + window_size]
-            segments.append(window)
+        for cat in np.unique(true_cat):
+            mask = (true_cat == cat)
+            n = int(mask.sum())
+            row = {
+                "n": n,
+                "acc@1": float(correct1[mask].mean()*100.0) if n > 0 else 0.0,
+            }
+            if include_acc5:
+                row["acc@5"] = float(hits5[mask].mean()*100.0) if n > 0 else 0.0
+            per_cat[str(cat)] = row
 
-        if not segments:
-            continue
+        results["per_category"] = per_cat  # {category: {"n": int, "acc@1": %, "acc@5": %?}}
 
-        X = torch.tensor(segments, dtype=torch.float).to(device)
+    # logging mirrors `evaluate`
+    if logger:
+        msg = " | ".join([f"acc@{k}: {results[f'acc@{k}']:.2f}%" for k in topk])
+        logger.info(f"✅ Contrastive — {msg}")
+        if "per_category" in results:
+            logger.info("Per-category acc:")
+            for cat, row in results["per_category"].items():
+                extras = f", acc@5={row['acc@5']:.2f}%" if ("acc@5" in row) else ""
+                logger.info(f"  - {cat}: n={row['n']}, acc@1={row['acc@1']:.2f}%{extras}")
+    else:
+        printable = {k: (round(v, 2) if isinstance(v, float) else v)
+                     for k, v in results.items() if "matrix" not in k and not isinstance(v, dict)}
+        print(printable)
 
-        with torch.no_grad():
-            smell_embed = sensor_encoder(X)  # Already outputs [B, 32]
-            smell_embed = F.normalize(smell_embed, dim=1)
-
-        all_smell_embeddings.append(smell_embed)
-        all_smell_labels.extend([label_idx] * smell_embed.shape[0])
-
-    if not all_smell_embeddings:
-        logger.warning("No valid smell embeddings were generated — check input data.")
-        return 0, 0, 0, 0, None
-
-    # Combine all smell embeddings
-    all_smell_embeddings = torch.cat(all_smell_embeddings, dim=0)
-    all_smell_labels = torch.tensor(all_smell_labels, dtype=torch.long).to(device)
-
-    # Compute similarity matrix
-    sim = torch.matmul(all_smell_embeddings, z_gcms.T)
-
-    # Top-1 GCMS prediction
-    predicted = sim.argmax(dim=1)
-
-    # Evaluate
-    correct = predicted == all_smell_labels
-    accuracy = correct.float().mean().item()
-    precision = precision_score(
-        all_smell_labels.cpu(), predicted.cpu(), average="macro"
-    )
-    recall = recall_score(all_smell_labels.cpu(), predicted.cpu(), average="macro")
-    f1 = f1_score(all_smell_labels.cpu(), predicted.cpu(), average="macro")
-    conf_matrix = confusion_matrix(all_smell_labels.cpu(), predicted.cpu())
-
-    logger.info(
-        "------------------Transformer Contrastive Evaluation---------------------"
-    )
-    logger.info(f"Accuracy: {accuracy:.4f}")
-    logger.info(f"Precision (macro): {precision:.4f}")
-    logger.info(f"Recall (macro): {recall:.4f}")
-    logger.info(f"F1-Score (macro): {f1:.4f}")
-    logger.info("Confusion Matrix:")
-    logger.info(f"\n{conf_matrix}")
-
-    return accuracy, precision, recall, f1, conf_matrix
+    return results

@@ -3,11 +3,9 @@ import torch
 import os
 import numpy as np
 from collections import defaultdict
-from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from utils import ingredient_to_category
-from dataset import PairedDataset, FusionDataset
-from scipy.fft import fft, ifft, fftfreq
+import re
 
 
 def subtract_first_row(df):
@@ -20,11 +18,10 @@ def load_sensor_data(
     ingredients=None,
     categories=None,
     real_time_testing_path=None,
+    removed_filtered_columns=[],
 ):
     training_data = defaultdict(list)
     testing_data = defaultdict(list)
-
-    min_len = float("inf")  # Track minimum length across all series
 
     # Helper: subtract first row
     def subtract_first_row(df):
@@ -38,8 +35,9 @@ def load_sensor_data(
                 if filename.endswith(".csv"):
                     cur_path = os.path.join(folder_path, filename)
                     df = pd.read_csv(cur_path)
+                    df = subtract_first_row(df)
+                    df = df.drop(columns=removed_filtered_columns)
                     training_data[folder_name].append(df)
-                    min_len = min(min_len, df.shape[0])  # Update minimum length
 
     for folder_name in os.listdir(testing_path):
         folder_path = os.path.join(testing_path, folder_name)
@@ -51,8 +49,9 @@ def load_sensor_data(
                         if filename.endswith(".csv"):
                             cur_path = os.path.join(folder_path, filename)
                             df = pd.read_csv(cur_path)
+                            df = subtract_first_row(df)
+                            df = df.drop(columns=removed_filtered_columns)
                             testing_data[folder_name].append(df)
-                            min_len = min(min_len, df.shape[0])  # Update minimum length
         else:
             if categories is None or ingredient_to_category[folder_name] in categories:
                 if os.path.isdir(folder_path):  # Make sure it's a folder
@@ -60,29 +59,27 @@ def load_sensor_data(
                         if filename.endswith(".csv"):
                             cur_path = os.path.join(folder_path, filename)
                             df = pd.read_csv(cur_path)
+                            df = subtract_first_row(df)
+                            df = df.drop(columns=removed_filtered_columns)
                             testing_data[folder_name].append(df)
-                            min_len = min(min_len, df.shape[0])  # Update minimum length
-    print(real_time_testing_path)
-    if real_time_testing_path:
-        real_time_testing_data = defaultdict(list)
-        for folder_name in os.listdir(real_time_testing_path):
-            folder_path = os.path.join(real_time_testing_path, folder_name)
 
-            if os.path.isdir(folder_path):  # Make sure it's a folder
-                for filename in os.listdir(folder_path):
-                    if filename.endswith(".csv"):
-                        cur_path = os.path.join(folder_path, filename)
-                        df = pd.read_csv(cur_path)
-                        real_time_testing_data[folder_name].append(df)
-                        min_len = min(min_len, df.shape[0])  # Update minimum length
-        
-        return training_data, testing_data, real_time_testing_data, min_len
-    else:
-        
-        return training_data, testing_data, min_len
+    real_time_testing_data = defaultdict(list)
+    for folder_name in os.listdir(real_time_testing_path):
+        folder_path = os.path.join(real_time_testing_path, folder_name)
+
+        if os.path.isdir(folder_path):  # Make sure it's a folder
+            for filename in os.listdir(folder_path):
+                if filename.endswith(".csv"):
+                    cur_path = os.path.join(folder_path, filename)
+                    df = pd.read_csv(cur_path)
+                    df = subtract_first_row(df)
+                    df = df.drop(columns=removed_filtered_columns)
+                    real_time_testing_data[folder_name].append(df)
+
+    return training_data, testing_data, real_time_testing_data
 
 
-def load_gcms_data(path, le=None):
+def load_gcms_data(path):
     df = pd.read_csv(path)
 
     feature_cols = df.columns[1:]
@@ -95,12 +92,8 @@ def load_gcms_data(path, le=None):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # Encode labels
-    if le is None:
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-    else:
-        y_encoded = le.transform(y)
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
 
     return X_scaled, y_encoded, le, scaler
 
@@ -124,11 +117,26 @@ def load_text_data(path, le=None):
     return X_scaled, y_encoded, le, scaler
 
 
-def prepare_data_transformer(data, le, apply_fft=False, sampling_rate=1.0, cutoff=0.05):
+def make_sliding_window_dataset(
+    data: dict[str, list[pd.DataFrame]],
+    le,
+    window_size: int = 100,
+    stride: int = 50,
+):
+    """
+    Build a windowed time-series dataset from {label: [DataFrame, ...]}.
+
+    Returns
+    -------
+    X : np.ndarray, shape [N, window_size, C]
+        Stacked sliding windows of features.
+    y : np.ndarray, shape [N]
+        Label-encoded class IDs aligned with X.
+    label_encoder : same as input
+        Returned unchanged; must be pre-fitted (uses .transform()).
+    """
     X = []
     y = []
-    window_size = 100
-    stride = 50
 
     for ingredient, dfs in data.items():
         for df in dfs:
@@ -140,200 +148,30 @@ def prepare_data_transformer(data, le, apply_fft=False, sampling_rate=1.0, cutof
     y = le.transform(y)
     X = np.array(X)  # shape: [N, T, C]
 
-    # === Apply FFT-based denoising ===
-    if apply_fft:
-        X = preprocess_frequency_cleaning(X, sampling_rate=sampling_rate, cutoff=cutoff)
-
-    return X, y, le
-
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long)
-
-    dataset = TensorDataset(X_tensor, y_tensor)
-    data_loader = DataLoader(dataset, batch_size=16, shuffle=True)
-    return data_loader, le
+    return X, y
 
 
-def prepare_data_gradient(
-    data,
-    dropped_columns=None,
-    period_len=50,
-    trim_len=10,
-    le=None,
-    contrastive_learning=False,
+def diff_data_like(
+    data: dict,
+    periods: int = 25,
 ):
-    X = []
-    y = []
-
-    for ingredient, dfs in data.items():
+    out = {}
+    for label, dfs in data.items():
+        out_list = []
         for df in dfs:
-            df = df.copy()
-
-            # Drop specified columns (safely)
-            if dropped_columns:
-                df.drop(
-                    columns=[col for col in dropped_columns if col in df.columns],
-                    inplace=True,
-                )
-
-            # Compute gradient (difference)
-            diff_data = df.diff(periods=period_len)
-            diff_data = diff_data.iloc[
-                period_len:
-            ]  # Drop first `period_len` rows with NaNs
-
-            # Trim first and last `trim_len` rows if enough data
-            if diff_data.shape[0] > 2 * trim_len:
-                diff_data = diff_data.iloc[trim_len:-trim_len]
-
-            # Keep only sensor columns
-            sensor_cols = [
-                col
-                for col in diff_data.columns
-                if (dropped_columns is None) or (col not in dropped_columns)
-            ]
-
-            # Remove rows where all sensors are zero
-            diff_data = diff_data[~(diff_data[sensor_cols] == 0).all(axis=1)]
-
-            if diff_data.shape[0] > 0:
-                X.append(diff_data[sensor_cols].values)
-                y.extend([ingredient] * diff_data.shape[0])
-
-    X_concat = np.concatenate(X, axis=0)  # shape: (total_rows, num_features)
-
-    if le is None:
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-    else:
-        y_encoded = le.transform(y)
-
-    return X_concat, y_encoded, le
+            diff_df = df.diff(periods=periods).iloc[periods:]
+            out_list.append(diff_df)
+        out[label] = out_list
+    return out
 
 
-def prepare_data_transformer_gradient(
-    data, le=None, dropped_columns=None, period_len=50, trim_len=10, apply_fft=False, sampling_rate=1.0, cutoff=0.05
-):
-    X = []
-    y = []
-    window_size = 100
-    stride = 50
-
-    for ingredient, dfs in data.items():
-        for df in dfs:
-            df = df.copy()
-
-            # Drop specified columns (if any)
-            if dropped_columns:
-                df.drop(
-                    columns=[col for col in dropped_columns if col in df.columns],
-                    inplace=True,
-                )
-
-            # Compute gradient (difference over period_len)
-            diff_data = df.diff(periods=period_len)
-            diff_data = diff_data.iloc[period_len:]  # Drop first rows with NaNs
-
-            # Trim first and last `trim_len` rows if long enough
-            if diff_data.shape[0] > 2 * trim_len:
-                diff_data = diff_data.iloc[trim_len:-trim_len]
-
-            # Keep only sensor columns
-            sensor_cols = [
-                col
-                for col in diff_data.columns
-                if dropped_columns is None or col not in dropped_columns
-            ]
-
-            # Remove rows where all sensors are zero
-            diff_data = diff_data[~(diff_data[sensor_cols] == 0).all(axis=1)]
-
-            # Apply sliding window over gradient data
-            for start in range(0, len(diff_data) - window_size + 1, stride):
-                window = diff_data.iloc[start : start + window_size].values
-                X.append(window)
-                y.append(ingredient)
-
-    if apply_fft:
-        X = np.array(X)  # shape: [N, T, C]
-        X = preprocess_frequency_cleaning(X, sampling_rate=sampling_rate, cutoff=cutoff)
-
-    y_encoded = le.transform(y)
-
-    return X, y_encoded, le
-
-
-def filter_outliers(group):
-    numerical_columns = group.select_dtypes(include=[np.number]).columns
-    for col in numerical_columns:
-        Q1 = group[col].quantile(0.2)
-        Q3 = group[col].quantile(0.8)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        group = group[(group[col] >= lower_bound) & (group[col] <= upper_bound)]
-    return group
-
-
-def select_median_representative(group, n=1):
-    median_values = group.median()  # Calculate the median of each feature
-    distances = np.linalg.norm(group - median_values, axis=1)  # Distance to median
-    group["distance"] = distances  # Add distances as a temporary column
-    closest_rows = group.nsmallest(n, "distance").drop(
-        columns="distance"
-    )  # Get n closest rows
-    return closest_rows
-
-
-def process_data_regular(data, le=None, dropped_columns=None):
-    X = []
-    y = []
-
-    for ingredient, dfs in data.items():
-        for df in dfs:
-            df = df.copy()
-
-            # Drop unwanted columns if specified
-            if dropped_columns:
-                df.drop(
-                    columns=[col for col in dropped_columns if col in df.columns],
-                    inplace=True,
-                )
-
-            # Remove rows where all values are 0
-            df = df[~(df == 0).all(axis=1)]
-
-            if df.shape[0] > 0:
-                X.append(df.values)
-                y.extend([ingredient] * len(df))
-
-    # Concatenate all data
-    X_concat = np.concatenate(X, axis=0)  # shape: (total_rows, num_features)
-
-    # Encode labels
-
-    if le is None:
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-    else:
-        y_encoded = le.transform(y)
-
-    X_tensor = torch.tensor(X_concat, dtype=torch.float32)
-    y_tensor = torch.tensor(y_encoded, dtype=torch.long)
-
-    return X_tensor, y_tensor, le
-
-
-def create_pair_data(smell_data, smell_label, gcms_data, le, fusion=False):
+def create_pair_data(smell_data, smell_label, gcms_data, le):
     pair_data = []
 
     for i in range(len(smell_label)):
         gcms_ix = smell_label[i]
-        if not fusion:
-            pair_data.append((gcms_data[gcms_ix], smell_data[i]))
-        else:
-            pair_data.append((gcms_data[gcms_ix], smell_data[i], gcms_ix))
-    return pair_data, le
+        pair_data.append((gcms_data[gcms_ix], smell_data[i]))
+    return pair_data
 
 
 def apply_random_feature_dropout(X, dropout_fraction=0.25, seed=None):
@@ -388,47 +226,115 @@ def apply_noise_injection(X, noise_scale=0.05, seed=None):
     return X_noisy
 
 
-def detect_dominant_frequencies(signal, sampling_rate=1.0):
+def highpass_fft_batch(X, sampling_rate=1.0, cutoff=0.05):
     """
-    Compute FFT and return frequency bins and magnitudes.
+    High-pass via FFT zeroing for an entire batch of windows.
+    X: np.ndarray (N, T, C)
+    cutoff: Hz (frequencies < cutoff are removed)
     """
-    fft_values = fft(signal)
-    freqs = fftfreq(len(signal), d=1 / sampling_rate)
-    magnitude = np.abs(fft_values)
-    return freqs, magnitude
+    X = np.asarray(X)
+    N, T, C = X.shape
+    # Real FFT along time
+    F = np.fft.rfft(X, axis=1)                       # (N, T//2+1, C)
+    freqs = np.fft.rfftfreq(T, d=1.0 / sampling_rate)  # (T//2+1,)
+    mask = (freqs >= cutoff)[None, :, None]          # broadcast to (1, F, 1)
+    F *= mask
+    X_clean = np.fft.irfft(F, n=T, axis=1)           # (N, T, C)
+    return X_clean
 
 
-def remove_periodic_components(signal, freqs, magnitude, cutoff=0.05):
-    """
-    Zero out low-frequency components below cutoff threshold.
-    """
-    fft_values = fft(signal)
-    cleaned_fft = np.where(np.abs(freqs) < cutoff, 0, fft_values)
-    cleaned_signal = ifft(cleaned_fft)
-    return np.real(cleaned_signal)
+def load_smell_recognition_data(directory_path):
+    ALL_INGREDIENTS = [
+        'banana', 'orange', 'pear', 'apple', 'mango', 'peach',
+        'strawberry', 'clove', 'coriander', 'garlic', 'almond', 'cumin'
+    ]
 
+    filenames = set()
 
-def clean_sample_channels(sample, sampling_rate=1.0, cutoff=0.05):
-    """
-    Apply periodic removal across all sensor channels in a sample.
-    Input: sample of shape [T, C] => time steps × channels
-    """
-    cleaned_channels = []
-    for ch_index in range(sample.shape[1]):
-        signal = sample[:, ch_index]
-        freqs, magnitude = detect_dominant_frequencies(signal, sampling_rate)
-        cleaned = remove_periodic_components(signal, freqs, magnitude, cutoff)
-        cleaned_channels.append(cleaned)
-    return np.stack(cleaned_channels, axis=1)  # Shape: [T, C]
+    for root, dirs, files in os.walk(directory_path):
+        for file in files:
+            filenames.add(file.split(".")[0])  # Remove extension
 
+    data = []
 
-def preprocess_frequency_cleaning(sensor_batch, sampling_rate=1.0, cutoff=0.05):
-    """
-    Clean an entire batch of sensor data.
-    Input shape: [N, T, C]
-    """
-    cleaned_batch = []
-    for i in range(sensor_batch.shape[0]):
-        cleaned = clean_sample_channels(sensor_batch[i], sampling_rate, cutoff)
-        cleaned_batch.append(cleaned)
-    return np.array(cleaned_batch)
+    for root, dirs, files in os.walk(directory_path):
+        for file in files:
+            name = file.split(".")[0]
+            name_cleaned = name.lower().replace("__", "_").replace("-", "_")
+
+            # Load your CSV (features) first
+            df = pd.read_csv(os.path.join(root, file))
+
+            # Initialize all zeros
+            ingredient_percentages = {ingredient: 0 for ingredient in ALL_INGREDIENTS}
+
+            parts = name_cleaned.split("_")
+
+            def fill_from_pairs(parts_list):
+                """Parse ingredient/percentage pairs like ['banana','50','mango','50']."""
+                for i in range(0, len(parts_list), 2):
+                    ing = parts_list[i]
+                    pct_str = parts_list[i + 1]
+                    if not ing.isalpha():
+                        raise ValueError(f"Invalid ingredient token '{ing}' in filename '{name}'.")
+                    if not pct_str.isdigit():
+                        raise ValueError(f"Invalid percentage token '{pct_str}' in filename '{name}'.")
+                    pct = int(pct_str)
+                    if not (0 <= pct <= 100):
+                        raise ValueError(f"Percentage out of range {pct} in filename '{name}'.")
+                    if ing in ingredient_percentages:
+                        ingredient_percentages[ing] = pct
+                    else:
+                        raise ValueError(f"Unknown ingredient '{ing}' in filename '{name}'.")
+
+            parsed = False
+
+            # Case A: clean even-length list of pairs
+            if len(parts) % 2 == 0 and len(parts) > 0:
+                try:
+                    fill_from_pairs(parts)
+                    parsed = True
+                except ValueError:
+                    parsed = False  # fall back to regex
+
+            # Case B: fallback — match mashed styles like 'banana50_orange50'
+            if not parsed:
+                pairs = re.findall(r'([a-z]+)[_]?(\d+)', name_cleaned)
+                if pairs:
+                    # Ensure everything in the filename is covered by the pairs we found
+                    # (optional strictness). We'll trust pairs if present.
+                    for ing, pct_str in pairs:
+                        pct = int(pct_str)
+                        if not (0 <= pct <= 100):
+                            raise ValueError(f"Percentage out of range {pct} in filename '{name}'.")
+                        if ing in ingredient_percentages:
+                            ingredient_percentages[ing] = pct
+                        else:
+                            raise ValueError(f"Unknown ingredient '{ing}' in filename '{name}'.")
+                    parsed = True
+
+            # Case C: single ingredient with no percentage -> assume 100
+            if not parsed:
+                # If all tokens are alpha and only one unique ingredient, assume 100
+                if all(tok.isalpha() for tok in parts) and len(set(parts)) == 1:
+                    ing = parts[0]
+                    if ing in ingredient_percentages:
+                        ingredient_percentages[ing] = 100
+                        parsed = True
+
+            if not parsed:
+                raise ValueError(f"Unrecognized filename format: '{name}'")
+
+            label_vector = [ingredient_percentages[ing] / 100 for ing in ALL_INGREDIENTS]
+
+            # Validate sum is exactly 100
+            total = sum(label_vector)
+            if total < 0.99:
+                raise ValueError(
+                    f"Percentages must sum to 100 (got {total}) for file '{file}' "
+                    f"-> vector {label_vector}"
+                )
+
+            data.append((df[:600], label_vector))
+
+    return data

@@ -44,43 +44,6 @@ class PairedDataset(Dataset):
         return gcms_vec, smell_vec
 
 
-class FusionDataset(Dataset):
-    def __init__(self, data, le, transformer=False):
-        """
-        data: list of (gcms_vec, smell_vec, ingredient_name)
-        le: fitted LabelEncoder to convert ingredient_name → label
-        transformer: whether to add time dim to smell_vec
-        """
-        self.data = data
-        self.le = le
-        self.transformer = transformer
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        gcms_vec, smell_vec, ingredient = self.data[idx]
-
-        # Safe tensor conversion
-        if isinstance(gcms_vec, torch.Tensor):
-            gcms_vec = gcms_vec.detach().clone()
-        else:
-            gcms_vec = torch.tensor(gcms_vec, dtype=torch.float)
-
-        if isinstance(smell_vec, torch.Tensor):
-            smell_vec = smell_vec.detach().clone()
-        else:
-            smell_vec = torch.tensor(smell_vec, dtype=torch.float)
-
-        # Add time dim if using transformer
-        if self.transformer:
-            smell_vec = smell_vec.unsqueeze(0)  # → (1, feature_dim)
-
-        label = ingredient
-
-        return gcms_vec, smell_vec, label
-
-
 class UniqueGCMSampler(Sampler):
     """
     Ensures each batch has unique gcms vectors.
