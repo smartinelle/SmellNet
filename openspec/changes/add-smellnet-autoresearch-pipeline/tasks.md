@@ -1,0 +1,14 @@
+## 1. Implementation
+- [x] 1.1 Add OpenSpec project context for SmellNet's paper-faithful preprocessing and deployment constraints.
+- [x] 1.2 Create an OpenSpec change proposal, task list, and design for the SmellNet autoresearch harness.
+- [x] 1.3 Scaffold a fixed SmellNet preprocessing module that reproduces the six-channel baseline and emits inference-ready metadata.
+- [x] 1.4 Scaffold a baseline training entrypoint that saves checkpoint, metrics, scaler statistics, label ordering, and model configuration.
+- [x] 1.5 Add an autoresearch program document describing the optimization target and guardrails.
+- [x] 1.6 Validate the OpenSpec change via `openspec validate add-smellnet-autoresearch-pipeline --strict`.
+- [x] 1.7 Make the first tracked experiment explicit: exact-upstream, transformer, no contrastive learning, window-level objective.
+- [x] 1.8 Run a smoke training job to verify artifact emission and tighten any broken imports or paths.
+- [x] 1.9 Add grouped file-level validation support for search without touching the official test split during selection.
+- [x] 1.10 Add a budgeted exact-upstream transformer search controller with validation-locked model selection.
+- [x] 1.11 Run a smoke search and then launch the first long-running exact-upstream autoresearch loop.
+- [x] 1.12 Add a phase-2 promoted search controller with optimizer-policy search and rotated grouped validation.
+- [x] 1.13 Run a short phase-2 smoke search and verify the staged artifact flow.

@@ -1,0 +1,6 @@
+.claude/
+.codex/
+.venv/
+autoresearch_runs/
+__pycache__/
+*.pyc
