@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.models import Transformer
+from models.models import GCMSMLPEncoder, Transformer
 
 from autoresearch_smellnet.prepare import (
     BaselineConfig,
@@ -136,6 +136,21 @@ def build_transformer(
         num_heads=num_heads,
         num_layers=num_layers,
         dropout=dropout,
+    ).to(device)
+
+
+def build_gcms_encoder(
+    *,
+    input_dim: int,
+    embedding_dim: int,
+    dropout: float,
+    device: torch.device,
+) -> GCMSMLPEncoder:
+    return GCMSMLPEncoder(
+        in_features=input_dim,
+        embedding_dim=embedding_dim,
+        dropout=dropout,
+        l2_normalize=False,
     ).to(device)
 
 

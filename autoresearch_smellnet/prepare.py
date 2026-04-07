@@ -11,6 +11,8 @@ import torch
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
+from models.dataset import PairedDataset, UniqueGCMSampler
+
 
 RAW_SENSOR_COLUMNS = [
     "NO2",
@@ -85,6 +87,14 @@ class PreparedSearchSplit:
     scaler_scale: list[float]
     config: BaselineConfig
     split_summary: dict
+
+
+@dataclass(frozen=True)
+class PreparedGCMSBank:
+    X_gcms: np.ndarray
+    label_names: list[str]
+    scaler_mean: list[float]
+    scaler_scale: list[float]
 
 
 def _canonicalize_sensor_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -189,6 +199,32 @@ def _apply_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
 
 def _collect_label_names(train_dir: Path) -> list[str]:
     return sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+
+
+def load_gcms_bank(gcms_csv: str | Path, *, expected_labels: list[str]) -> PreparedGCMSBank:
+    gcms_path = Path(gcms_csv)
+    df = pd.read_csv(gcms_path)
+    label_col = df.columns[0]
+    feature_cols = list(df.columns[1:])
+
+    labels = df[label_col].astype(str).tolist()
+    if sorted(labels) != sorted(expected_labels):
+        raise ValueError(
+            "GC-MS labels do not match the sensor labels. "
+            f"Expected {len(expected_labels)} labels, got {len(labels)} labels from {gcms_path}."
+        )
+
+    label_to_row = {label: idx for idx, label in enumerate(labels)}
+    ordered = df.set_index(label_col).loc[expected_labels, feature_cols].astype(np.float32)
+    scaler = StandardScaler()
+    X_gcms = scaler.fit_transform(ordered.values.astype(np.float32)).astype(np.float32)
+
+    return PreparedGCMSBank(
+        X_gcms=X_gcms,
+        label_names=list(expected_labels),
+        scaler_mean=scaler.mean_.astype(float).tolist(),
+        scaler_scale=scaler.scale_.astype(float).tolist(),
+    )
 
 
 def _grouped_validation_paths(
@@ -345,6 +381,22 @@ def make_search_dataloaders(prepared: PreparedSearchSplit) -> tuple[DataLoader, 
     val_loader = DataLoader(val_ds, batch_size=prepared.config.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=prepared.config.batch_size, shuffle=False)
     return train_loader, val_loader, test_loader
+
+
+def make_contrastive_train_loader(
+    prepared: PreparedSearchSplit,
+    gcms_bank: PreparedGCMSBank,
+) -> DataLoader:
+    if prepared.label_names != gcms_bank.label_names:
+        raise ValueError("Sensor and GC-MS label order mismatch.")
+
+    pair_data = [
+        (gcms_bank.X_gcms[int(label_idx)], sensor_window)
+        for sensor_window, label_idx in zip(prepared.X_train, prepared.y_train, strict=True)
+    ]
+    train_dataset = PairedDataset(pair_data)
+    sampler = UniqueGCMSampler(train_dataset.data, batch_size=prepared.config.batch_size)
+    return DataLoader(train_dataset, batch_size=prepared.config.batch_size, sampler=sampler)
 
 
 def accuracy_at_k(logits: torch.Tensor, labels: torch.Tensor, k: int) -> float:

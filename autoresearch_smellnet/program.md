@@ -34,3 +34,10 @@ Secondary objectives:
 - Search optimization-policy knobs before adding new architectures:
   `lr`, `weight_decay`, `label_smoothing`, `warmup_ratio`, `model_dim`, `num_heads`, `num_layers`, `dropout`
 - Reduce validation noise with rotated grouped validation folds.
+
+## Contrastive track
+- Use the same exact-upstream sensor preprocessing contract as the supervised baseline.
+- Load `data/gcms_dataframe.csv` as a fixed 50-class GC-MS bank aligned to the sensor label order.
+- Train a transformer sensor encoder and GC-MS MLP encoder with cross-modal contrastive loss.
+- Keep grouped validation and validation-locked final test evaluation.
+- Treat contrastive search as a separate track from the supervised benchmark anchor.
